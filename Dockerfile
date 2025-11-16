@@ -1,23 +1,25 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (updated package names for Debian 12)
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
+    libgthread-2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Download YOLO11 pose model
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')"
