@@ -9,6 +9,7 @@ from ultralytics import YOLO
 from typing import List, Tuple, Dict
 import logging
 from collections import deque
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -172,103 +173,149 @@ class KaratePoseAnalyzer:
         logger.info(f"Analyzing video: {video_path}")
         
         cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            raise Exception(f"Failed to open video: {video_path}")
+        
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Output video path
+        logger.info(f"Video properties: {width}x{height} @ {fps}fps, {total_frames} frames")
+        
+        # Ensure temp directory exists
+        os.makedirs('temp', exist_ok=True)
+        
+        # Output video path - use H.264 codec for web compatibility
         output_path = os.path.join('temp', 'analyzed_output.mp4')
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        # Use H.264 codec (avc1) for better web compatibility
+        # This is the most widely supported codec for web browsers
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        if not out.isOpened():
+            # Fallback to mp4v if avc1 fails
+            logger.warning("avc1 codec failed, trying mp4v...")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                # Last resort: try X264
+                logger.warning("mp4v codec failed, trying X264...")
+                fourcc = cv2.VideoWriter_fourcc(*'X264')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                
+                if not out.isOpened():
+                    cap.release()
+                    raise Exception("Failed to create video writer with any codec")
         
         # Moving average for performance
         performance_scores = deque(maxlen=30)  # Last 30 frames
         frame_idx = 0
         
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Run pose estimation on user video
-            results = self.model(frame, verbose=False)
-            
-            if len(results) > 0 and results[0].keypoints is not None:
-                keypoints = results[0].keypoints.xy.cpu().numpy()
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                if len(keypoints) > 0:
-                    user_keypoints = keypoints[0]
+                # Run pose estimation on user video
+                results = self.model(frame, verbose=False)
+                
+                if len(results) > 0 and results[0].keypoints is not None:
+                    keypoints = results[0].keypoints.xy.cpu().numpy()
                     
-                    # Get matching reference pose
-                    ref_idx = self._get_matching_reference_frame(
-                        frame_idx, total_frames
-                    )
-                    ref_keypoints = self.reference_poses[ref_idx]
-                    
-                    # Analyze each body part
-                    frame_scores = []
-                    
-                    for part_name, keypoint_names in self.TRACKED_PARTS.items():
-                        # Get indices for this body part
-                        indices = [
-                            self.KEYPOINT_MAPPING[kp] 
-                            for kp in keypoint_names
-                        ]
+                    if len(keypoints) > 0:
+                        user_keypoints = keypoints[0]
                         
-                        # Calculate similarity
-                        similarity = self._calculate_similarity(
-                            user_keypoints, ref_keypoints, indices
+                        # Get matching reference pose
+                        ref_idx = self._get_matching_reference_frame(
+                            frame_idx, total_frames
                         )
-                        frame_scores.append(similarity)
+                        ref_keypoints = self.reference_poses[ref_idx]
                         
-                        # Draw boxes around keypoints
-                        color = (0, 255, 0) if similarity > 0.7 else (0, 0, 255)
+                        # Analyze each body part
+                        frame_scores = []
                         
-                        for idx in indices:
-                            if idx < len(user_keypoints):
-                                x, y = user_keypoints[idx]
-                                if x > 0 and y > 0:
-                                    cv2.rectangle(
-                                        frame,
-                                        (int(x) - 15, int(y) - 15),
-                                        (int(x) + 15, int(y) + 15),
-                                        color,
-                                        2
-                                    )
-                                    cv2.putText(
-                                        frame,
-                                        part_name,
-                                        (int(x) - 15, int(y) - 20),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        color,
-                                        1
-                                    )
-                    
-                    # Update moving average
-                    if frame_scores:
-                        performance_scores.append(np.mean(frame_scores))
-            
-            # Draw performance score
-            if performance_scores:
-                avg_score = np.mean(performance_scores) * 100
-                cv2.rectangle(frame, (10, 10), (250, 60), (0, 0, 0), -1)
-                cv2.putText(
-                    frame,
-                    f"Performance: {avg_score:.1f}%",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
-                )
-            
-            out.write(frame)
-            frame_idx += 1
+                        for part_name, keypoint_names in self.TRACKED_PARTS.items():
+                            # Get indices for this body part
+                            indices = [
+                                self.KEYPOINT_MAPPING[kp] 
+                                for kp in keypoint_names
+                            ]
+                            
+                            # Calculate similarity
+                            similarity = self._calculate_similarity(
+                                user_keypoints, ref_keypoints, indices
+                            )
+                            frame_scores.append(similarity)
+                            
+                            # Draw boxes around keypoints
+                            color = (0, 255, 0) if similarity > 0.7 else (0, 0, 255)
+                            
+                            for idx in indices:
+                                if idx < len(user_keypoints):
+                                    x, y = user_keypoints[idx]
+                                    if x > 0 and y > 0:
+                                        cv2.rectangle(
+                                            frame,
+                                            (int(x) - 15, int(y) - 15),
+                                            (int(x) + 15, int(y) + 15),
+                                            color,
+                                            2
+                                        )
+                                        cv2.putText(
+                                            frame,
+                                            part_name,
+                                            (int(x) - 15, int(y) - 20),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.4,
+                                            color,
+                                            1
+                                        )
+                        
+                        # Update moving average
+                        if frame_scores:
+                            performance_scores.append(np.mean(frame_scores))
+                
+                # Draw performance score
+                if performance_scores:
+                    avg_score = np.mean(performance_scores) * 100
+                    cv2.rectangle(frame, (10, 10), (250, 60), (0, 0, 0), -1)
+                    cv2.putText(
+                        frame,
+                        f"Performance: {avg_score:.1f}%",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2
+                    )
+                
+                out.write(frame)
+                frame_idx += 1
+                
+                # Log progress every 30 frames
+                if frame_idx % 30 == 0:
+                    logger.info(f"Processed {frame_idx}/{total_frames} frames")
         
-        cap.release()
-        out.release()
+        finally:
+            # CRITICAL: Always release resources
+            cap.release()
+            out.release()
+            cv2.destroyAllWindows()
         
-        logger.info(f"Analysis complete. Output saved to: {output_path}")
+        # Verify output file was created and has content
+        if not os.path.exists(output_path):
+            raise Exception(f"Output video was not created: {output_path}")
+        
+        output_size = os.path.getsize(output_path)
+        if output_size == 0:
+            raise Exception(f"Output video is empty: {output_path}")
+        
+        logger.info(f"✅ Analysis complete. Output saved to: {output_path}")
+        logger.info(f"✅ Output file size: {output_size / (1024*1024):.2f} MB")
+        
         return output_path
