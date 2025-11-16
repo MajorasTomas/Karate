@@ -1,41 +1,28 @@
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies (updated package names for Debian 12)
+# System dependencies (rarely changes - cached)
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
     libgomp1 \
-    libgthread-2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Requirements first (only rebuilds if requirements.txt changes)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Download YOLO11 pose model
+# YOLO model (cached after first download)
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')"
 
-# Copy application code
+# App code last (changes most frequently)
 COPY . .
 
-# Create necessary directories
 RUN mkdir -p temp models reference_videos
 
-# Expose port
 EXPOSE 8000
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PORT=8000
-
-# Run the application
-CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
+# Fixed: Use sh -c to properly expand PORT variable
+CMD sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
