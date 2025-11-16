@@ -3,16 +3,16 @@ FastAPI application for karate pose analysis
 """
 
 import os
+import json
 import logging
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl
 from typing import Optional
 import uvicorn
 
 from app.pose_analyzer import KaratePoseAnalyzer
-from app.video_processor import VideoProcessor
-from app.utils import download_from_gcs, cleanup_temp_files
+from app.utils import download_from_gcs, cleanup_temp_files, upload_to_gcs
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +20,35 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def setup_gcs_credentials():
+    """Write GCS credentials from environment variable to file"""
+    creds_json = os.getenv("GCS_CREDENTIALS_JSON")
+    if creds_json:
+        try:
+            creds_path = "/tmp/gcs-credentials.json"
+            
+            # Parse JSON if it's a string
+            if isinstance(creds_json, str):
+                creds_data = json.loads(creds_json)
+            else:
+                creds_data = creds_json
+            
+            # Write to file
+            with open(creds_path, 'w') as f:
+                json.dump(creds_data, f)
+            
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+            logger.info(f"✅ GCS credentials file created at {creds_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to setup GCS credentials: {str(e)}")
+    else:
+        logger.warning("⚠️  GCS_CREDENTIALS_JSON not found in environment variables")
+
+
+# Setup credentials before starting app
+setup_gcs_credentials()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -68,112 +97,88 @@ async def health_check():
     return HealthResponse(status="healthy", version="1.0.0")
 
 
-@app.post("/analyze")
+@app.post("/analyze", status_code=status.HTTP_204_NO_CONTENT)
 async def analyze_video(
     request: AnalyzeRequest,
     background_tasks: BackgroundTasks
 ):
     """
-    Analyze karate pose from user video
+    Analyze karate pose from user video and upload to Google Cloud Storage
+    
+    This endpoint does not return any data. It processes the video and
+    uploads the analyzed result to Google Cloud Storage.
     
     Args:
-        request: Contains video_url from Google Cloud Storage
-        background_tasks: FastAPI background tasks for cleanup
+        request: Contains video_url and optional user_id
         
     Returns:
-        Video buffer with pose analysis overlay
-        Filename in response headers
+        204 No Content (empty response)
     """
     temp_input_path = None
     temp_output_path = None
     
     try:
-        logger.info(f"Received analysis request for video: {request.video_url}")
+        user_id = request.user_id or "anonymous"
+        logger.info(f"📥 Received analysis request for user: {user_id}")
+        logger.info(f"   Input video URL: {request.video_url}")
         
-        # Download video from GCS
-        logger.info("Downloading video from Google Cloud Storage...")
+        # Step 1: Download video
+        logger.info("⬇️  Downloading video...")
         temp_input_path = download_from_gcs(str(request.video_url))
         
         if not os.path.exists(temp_input_path):
             raise HTTPException(status_code=400, detail="Failed to download video")
         
-        # Get analyzer instance
+        logger.info(f"✅ Downloaded to: {temp_input_path}")
+        
+        # Step 2: Get analyzer instance
         pose_analyzer = get_analyzer()
         
-        # Process video
-        logger.info("Processing video with pose analysis...")
+        # Step 3: Analyze video
+        logger.info("🤖 Analyzing video with YOLO pose detection...")
         temp_output_path = pose_analyzer.analyze_video(temp_input_path)
         
         if not os.path.exists(temp_output_path):
-            raise HTTPException(
-                status_code=500, 
-                detail="Video processing failed"
-            )
+            raise HTTPException(status_code=500, detail="Video processing failed")
         
-        # Read processed video as buffer
-        logger.info("Reading processed video...")
-        with open(temp_output_path, 'rb') as video_file:
-            video_buffer = video_file.read()
+        logger.info(f"✅ Analysis complete: {temp_output_path}")
         
-        # Generate dynamic filename based on user_id or timestamp
-        filename = _generate_output_filename(request.user_id)
+        # Step 4: Upload to Google Cloud Storage
+        filename = "AnalyzedVideo.mp4"  # Hardcoded name
+        logger.info(f"⬆️  Uploading to Google Cloud Storage as '{filename}'...")
         
-        # Schedule cleanup in background
+        video_url, gcs_path = upload_to_gcs(
+            file_path=temp_output_path,
+            filename=filename,
+            user_id=user_id
+        )
+        
+        logger.info(f"✅ Uploaded to GCS: {gcs_path}")
+        logger.info(f"🔗 Video URL: {video_url}")
+        
+        # Step 5: Schedule cleanup in background
         background_tasks.add_task(
             cleanup_temp_files, 
             [temp_input_path, temp_output_path]
         )
         
-        logger.info(f"Video analysis completed successfully: {filename}")
+        logger.info("🎉 Process completed successfully!")
         
-        # Return video buffer with filename in headers
-        return Response(
-            content=video_buffer,
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "X-Filename": filename,  # Easy-to-access custom header
-                "X-File-Size": str(len(video_buffer)),
-                "X-User-ID": request.user_id or "anonymous"
-            }
-        )
+        # Return nothing (204 No Content)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        cleanup_temp_files([temp_input_path, temp_output_path])
+        raise
         
     except Exception as e:
-        logger.error(f"Error during video analysis: {str(e)}", exc_info=True)
-        
-        # Cleanup on error
+        logger.error(f"❌ Error during video analysis: {str(e)}", exc_info=True)
         cleanup_temp_files([temp_input_path, temp_output_path])
-        
         raise HTTPException(
             status_code=500,
             detail=f"Video analysis failed: {str(e)}"
         )
-
-
-def _generate_output_filename(user_id: Optional[str]) -> str:
-    """
-    Generate output filename based on user_id or timestamp
-    
-    Args:
-        user_id: Optional user identifier
-        
-    Returns:
-        Generated filename (e.g., "analyzed_user123.mp4" or "analyzed_20251116_143052.mp4")
-    """
-    from datetime import datetime
-    
-    if user_id:
-        # Use user ID if provided
-        # Clean user_id to make it safe for filenames
-        safe_user_id = "".join(c for c in user_id if c.isalnum() or c in ('-', '_'))
-        filename = f"analyzed_{safe_user_id}.mp4"
-    else:
-        # Use timestamp if no user_id
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"analyzed_{timestamp}.mp4"
-    
-    return filename
-
 
 
 if __name__ == "__main__":
